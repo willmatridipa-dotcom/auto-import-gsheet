@@ -57,9 +57,17 @@ def upload_to_gsheet(data):
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         
-        # Pastikan file credentials.json ada di folder yang sama
-        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+        # --- PERBAIKAN DI SINI ---
+        # Kita ambil isi JSON dari Secret GitHub, bukan dari file credentials.json
+        creds_raw = os.getenv('GCP_SERVICE_ACCOUNT')
+        if not creds_raw:
+            print("Error: Secret GCP_SERVICE_ACCOUNT tidak ditemukan!")
+            return
+            
+        creds_info = json.loads(creds_raw)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_info, scope)
         client = gspread.authorize(creds)
+        # -------------------------
         
         # ID GSheet Baru yang kamu kasih
         ID_GSHEET = "1OTLX_utgRO_iUNeESw5K83fI8p9sLjWvdXZy7-iuSoQ"
