@@ -10,8 +10,8 @@ def get_metabase_data():
     # --- CONFIG METABASE ---
     # Ganti dengan URL Metabase kamu (jangan ada slash / di ujung)
     METABASE_URL = "https://mb-dynamic.rata.id" # Hapus slash di ujung agar konsisten
-    USERNAME = "willma.tridipa@rata.id"
-    PASSWORD = "metabasedynamic12"
+    USERNAME = os.getenv('METABASE_USER')
+    PASSWORD = os.getenv('METABASE_PASS')
   
     
     # ID Question/Card yang mau ditarik
