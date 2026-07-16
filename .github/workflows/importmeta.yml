@@ -2,7 +2,7 @@ name: Sync Metabase Payment Card 39
 
 on:
   schedule:
-    - cron: '0 1 * * *' # Jalan otomatis jam 8 pagi WIB
+    - cron: '0 23 * * *' # Jalan otomatis jam 8 pagi WIB
   workflow_dispatch: # Supaya ada tombol "Run" manual
 
 jobs:
