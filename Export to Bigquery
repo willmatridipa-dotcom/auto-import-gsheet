@@ -1,0 +1,154 @@
+"""
+========================================================
+   ROBOT PEMBUAT BANYAK TABEL BIGQUERY DARI GSHEET
+   VERSION: v12-native-row-cleaner (GitHub Actions Ready)
+========================================================
+"""
+
+import os
+import re
+import pandas as pd
+import gspread
+from google.oauth2 import service_account
+from google.cloud import bigquery
+
+SCRIPT_VERSION = "v12-native-row-cleaner"
+
+# ============================================================
+#  SETTING
+# ============================================================
+
+# Menggunakan file 'kunci-bg.json' yang ada di folder kerja/repository yang sama
+PATH_KUNCI        = os.path.join(os.path.dirname(__file__), "kunci-bg.json")
+CONFIG_SHEET_URL  = "https://docs.google.com/spreadsheets/d/1y_Z8GO2nrUFVwUv-_PnTgJL3NKQwu7koNNtfh1VRaEY"
+CONFIG_TAB_NAME   = "config"
+
+BQ_PROJECT      = "backup-444202"
+BQ_DATASET      = "DataLabReady"
+DEFAULT_RANGE   = "A1:Z10000"
+
+# ============================================================
+
+
+def buat_credentials():
+    scopes = [
+        "https://www.googleapis.com/auth/bigquery",
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+    ]
+    return service_account.Credentials.from_service_account_file(PATH_KUNCI, scopes=scopes)
+
+
+def baca_config_sheet(creds):
+    gc = gspread.authorize(creds)
+    ws = gc.open_by_url(CONFIG_SHEET_URL).worksheet(CONFIG_TAB_NAME)
+    semua = ws.get_all_records()
+
+    bersih = []
+    for baris in semua:
+        table_name = str(baris.get("table_name", "")).strip()
+        if not table_name:
+            continue
+
+        bersih.append({
+            "table_name": table_name,
+            "gsheet_url": str(baris.get("gsheet_url", "")).strip(),
+            "sheet_name": str(baris.get("sheet_name", "")).strip(),
+            "range_name": str(baris.get("range_name", "")).strip() or DEFAULT_RANGE,
+        })
+
+    print(f"Ditemukan {len(bersih)} tabel yang akan diproses.\n")
+    return bersih
+
+
+def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, range_name):
+    clean_table_name = re.sub(r'[^a-zA-Z0-9_]', '_', str(table_name).strip())
+    clean_table_name = re.sub(r'_+', '_', clean_table_name).strip('_')
+    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{clean_table_name}"
+
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_url(gsheet_url)
+    ws = sh.worksheet(sheet_name)
+    
+    data = ws.get(range_name)
+    if not data or len(data) <= 1:
+        print(f"   SKIP: Range '{range_name}' kosong!\n")
+        return
+
+    df = pd.DataFrame(data[1:], columns=data[0])
+
+    clean_columns = []
+    seen_names = set()
+    for idx, col in enumerate(df.columns, start=1):
+        nama_kolom = str(col).strip()
+        clean_col = re.sub(r'[^a-zA-Z0-9_]', '_', nama_kolom) if nama_kolom else f"empty_col_{idx}"
+        clean_col = re.sub(r'_+', '_', clean_col).strip('_')
+        
+        if clean_col and clean_col[0].isdigit():
+            clean_col = f"col_{clean_col}"
+        if not clean_col:
+            clean_col = f"empty_col_{idx}"
+            
+        original_clean = clean_col
+        counter = 1
+        while clean_col in seen_names:
+            clean_col = f"{original_clean}_{counter}"
+            counter += 1
+            
+        seen_names.add(clean_col)
+        clean_columns.append(clean_col)
+        
+    df.columns = clean_columns
+
+    df = df.replace(r'^\s*$', None, regex=True)
+    df = df.dropna(how='all').reset_index(drop=True)
+
+    for col in df.columns:
+        if any(kunci in col.lower() for kunci in ['time', 'date', 'tgl', 'stamp', 'created', 'updated']):
+            df[col] = pd.to_datetime(df[col], errors='coerce', format='mixed')
+
+    job_config = bigquery.LoadJobConfig(
+        write_disposition="WRITE_TRUNCATE",
+        autodetect=True
+    )
+
+    print(f"   Mengunggah NATIVE TABLE: {BQ_DATASET}.{clean_table_name}")
+    print(f"     Jumlah Data : {len(df)} baris (baris kosong sudah dibuang)")
+
+    job = client.load_table_from_dataframe(df, table_id, job_config=job_config)
+    job.result()
+
+    print(f"   BERHASIL! Native Table '{clean_table_name}' siap!\n")
+
+
+def jalankan_semua():
+    print("=" * 60)
+    print(f"     ROBOT NATIVE TABLE BIGQUERY ({SCRIPT_VERSION})")
+    print("=" * 60 + "\n")
+
+    creds  = buat_credentials()
+    client = bigquery.Client(credentials=creds, project=BQ_PROJECT)
+    daftar_tabel = baca_config_sheet(creds)
+
+    berhasil = 0
+    gagal    = 0
+
+    for nomor, baris in enumerate(daftar_tabel, start=1):
+        print(f"[{nomor}/{len(daftar_tabel)}] Memproses '{baris['table_name']}'...")
+        try:
+            buat_satu_tabel_native(
+                client, creds, baris["table_name"],
+                baris["gsheet_url"], baris["sheet_name"], baris["range_name"]
+            )
+            berhasil += 1
+        except Exception as e:
+            print(f"   GAGAL: {e}\n")
+            gagal += 1
+
+    print("=" * 60)
+    print(f"     SELESAI! Berhasil: {berhasil} | Gagal: {gagal}")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    jalankan_semua()
