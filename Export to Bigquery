@@ -1,25 +1,23 @@
 """
 ========================================================
    ROBOT PEMBUAT BANYAK TABEL BIGQUERY DARI GSHEET
-   VERSION: v12-native-row-cleaner (GitHub Actions Ready)
+   VERSION: v12.1-native-schema-builder (Actions & Local Ready)
 ========================================================
 """
 
 import os
 import re
+import json
 import pandas as pd
 import gspread
 from google.oauth2 import service_account
 from google.cloud import bigquery
 
-SCRIPT_VERSION = "v12-native-row-cleaner"
+SCRIPT_VERSION = "v12.1-native-schema-builder"
 
 # ============================================================
-#  SETTING
+# SETTING
 # ============================================================
-
-# Menggunakan file 'kunci-bg.json' yang ada di folder kerja/repository yang sama
-PATH_KUNCI        = os.path.join(os.path.dirname(__file__), "kunci-bg.json")
 CONFIG_SHEET_URL  = "https://docs.google.com/spreadsheets/d/1y_Z8GO2nrUFVwUv-_PnTgJL3NKQwu7koNNtfh1VRaEY"
 CONFIG_TAB_NAME   = "config"
 
@@ -29,14 +27,60 @@ DEFAULT_RANGE   = "A1:Z10000"
 
 # ============================================================
 
-
 def buat_credentials():
     scopes = [
         "https://www.googleapis.com/auth/bigquery",
         "https://www.googleapis.com/auth/drive",
         "https://www.googleapis.com/auth/spreadsheets.readonly",
     ]
-    return service_account.Credentials.from_service_account_file(PATH_KUNCI, scopes=scopes)
+    # 1. Cek Kredensial via GitHub Environment Variable
+    if "GCP_SERVICE_ACCOUNT" in os.environ:
+        info = json.loads(os.environ["GCP_SERVICE_ACCOUNT"])
+        if "private_key" in info:
+            info["private_key"] = info["private_key"].replace("\\n", "\n")
+        return service_account.Credentials.from_service_account_info(info, scopes=scopes)
+    
+    # 2. Fallback jika running di komputer lokal (VS Code)
+    path_kunci_lokal = os.path.join(os.path.dirname(__file__), "kunci-bg.json")
+    return service_account.Credentials.from_service_account_file(path_kunci_lokal, scopes=scopes)
+
+
+def evaluasi_dan_konversi_kolom(s):
+    """
+    Menebak & Mengonversi tipe data satu kolom Pandas secara otomatis
+    (Mencakup Integer, Float, Date/Timestamp, dan String)
+    """
+    s_clean = s.dropna().astype(str).str.strip()
+    if s_clean.empty:
+        return s.astype(str)
+
+    # 1. Coba Konversi ke Date / Timestamp jika ada keyword atau pola tanggal
+    is_date_col = any(k in s.name.lower() for k in ['time', 'date', 'tgl', 'stamp', 'created', 'updated'])
+    if is_date_col:
+        parsed_dt = pd.to_datetime(s, errors='coerce', format='mixed')
+        if parsed_dt.notna().sum() > 0:
+            return parsed_dt
+
+    # 2. Coba Konversi Angka Bulat (Integer)
+    # Kebanyakan ID/Kode diawali angka 0, paksa tetap STRING agar 0 di depan tidak hilang
+    is_id_col = any(k in s.name.lower() for k in ['id', 'code', 'kode', 'phone', 'hp', 'nis', 'nik'])
+    if not is_id_col:
+        try:
+            # Pastikan tidak ada koma/titik format uang
+            s_num = s_clean.str.replace(',', '', regex=False)
+            if s_num.str.match(r'^-?\d+$').all():
+                return pd.to_numeric(s, errors='coerce').astype('Int64')
+        except Exception:
+            pass
+
+        # 3. Coba Konversi Angka Desimal (Float)
+        try:
+            if s_clean.str.match(r'^-?\d+(\.\d+)?$').all():
+                return pd.to_numeric(s, errors='coerce').astype('float64')
+        except Exception:
+            pass
+
+    return s.astype(str)
 
 
 def baca_config_sheet(creds):
@@ -75,8 +119,10 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
         print(f"   SKIP: Range '{range_name}' kosong!\n")
         return
 
+    # Inisialisasi DataFrame
     df = pd.DataFrame(data[1:], columns=data[0])
 
+    # 1. Bersihkan Nama Kolom
     clean_columns = []
     seen_names = set()
     for idx, col in enumerate(df.columns, start=1):
@@ -100,25 +146,27 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
         
     df.columns = clean_columns
 
+    # 2. Bersihkan Baris Kosong
     df = df.replace(r'^\s*$', None, regex=True)
     df = df.dropna(how='all').reset_index(drop=True)
 
+    # 3. TYPING LOGIC: Konversi Tipe Data Setiap Kolom
     for col in df.columns:
-        if any(kunci in col.lower() for kunci in ['time', 'date', 'tgl', 'stamp', 'created', 'updated']):
-            df[col] = pd.to_datetime(df[col], errors='coerce', format='mixed')
+        df[col] = evaluasi_dan_konversi_kolom(df[col])
 
+    # 4. Upload Ke BigQuery Native Table
     job_config = bigquery.LoadJobConfig(
         write_disposition="WRITE_TRUNCATE",
-        autodetect=True
+        autodetect=True  # Otomatis menyesuaikan Schema BigQuery dari Tipe Data Pandas
     )
 
     print(f"   Mengunggah NATIVE TABLE: {BQ_DATASET}.{clean_table_name}")
-    print(f"     Jumlah Data : {len(df)} baris (baris kosong sudah dibuang)")
+    print(f"     Jumlah Data : {len(df)} baris")
 
     job = client.load_table_from_dataframe(df, table_id, job_config=job_config)
     job.result()
 
-    print(f"   BERHASIL! Native Table '{clean_table_name}' siap!\n")
+    print(f"   BERHASIL! Native Table '{clean_table_name}' dengan schema presisi siap!\n")
 
 
 def jalankan_semua():
