@@ -1,0 +1,30 @@
+name: Sync GSheet to BigQuery Native
+
+on:
+  repository_dispatch:
+    types: [trigger-sync]
+  workflow_dispatch:
+
+jobs:
+  run-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          pip install pandas pyarrow gspread google-cloud-bigquery
+
+      - name: Create Key File from Secret
+        run: |
+          echo "${{ secrets.GCP_SERVICE_ACCOUNT }}" > kunci-bg.json
+
+      - name: Run Python Script
+        run: python "Export to Bigquery"
