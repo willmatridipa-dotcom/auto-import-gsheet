@@ -21,4 +21,4 @@ jobs:
           GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
           METABASE_USER: ${{ secrets.METABASE_USER }}
           METABASE_PASS: ${{ secrets.METABASE_PASS }}
-        run: python importmetabase.py # <--- INI KUNCINYA (Nama file baru)
+        run: python impormetabase.py # <--- INI KUNCINYA (Nama file baru)
