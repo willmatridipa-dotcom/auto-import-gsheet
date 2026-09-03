@@ -1,7 +1,7 @@
 """
 ========================================================
    ROBOT PEMBUAT BANYAK TABEL BIGQUERY DARI GSHEET
-   VERSION: v12.2-explicit-native-schema (Super Accurate)
+   VERSION: v12.3-zero-downtime-refresh (Auto Expiration)
 ========================================================
 """
 
@@ -14,8 +14,11 @@ import gspread
 from google.oauth2 import service_account
 from google.cloud import bigquery
 
-SCRIPT_VERSION = "v12.2-explicit-native-schema"
+SCRIPT_VERSION = "v12.3-zero-downtime-refresh"
 
+# ============================================================
+# SETTING
+# ============================================================
 CONFIG_SHEET_URL  = "https://docs.google.com/spreadsheets/d/1y_Z8GO2nrUFVwUv-_PnTgJL3NKQwu7koNNtfh1VRaEY"
 CONFIG_TAB_NAME   = "config"
 
@@ -31,12 +34,14 @@ def buat_credentials():
         "https://www.googleapis.com/auth/drive",
         "https://www.googleapis.com/auth/spreadsheets.readonly",
     ]
+    # 1. GitHub Actions Environment Variable
     if "GCP_SERVICE_ACCOUNT" in os.environ:
         info = json.loads(os.environ["GCP_SERVICE_ACCOUNT"])
         if "private_key" in info:
             info["private_key"] = info["private_key"].replace("\\n", "\n")
         return service_account.Credentials.from_service_account_info(info, scopes=scopes)
     
+    # 2. Local Fallback (VS Code)
     path_kunci_lokal = os.path.join(os.path.dirname(__file__), "kunci-bg.json")
     return service_account.Credentials.from_service_account_file(path_kunci_lokal, scopes=scopes)
 
@@ -80,7 +85,7 @@ def evaluasi_nilai_tunggal(val_str):
 
 
 def tebak_tipe_kolom(sampel_banyak_nilai, nama_kolom):
-    # Proteksi ID, Kode, HP agar angka 0 depan tidak hilang
+    # Proteksi ID, Kode, HP agar angka 0 di depan tidak hilang
     if any(k in nama_kolom.lower() for k in ['id', 'code', 'kode', 'phone', 'hp', 'nis', 'nik']):
         return "STRING"
 
@@ -107,7 +112,9 @@ def tebak_tipe_kolom(sampel_banyak_nilai, nama_kolom):
 def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, range_name):
     clean_table_name = re.sub(r'[^a-zA-Z0-9_]', '_', str(table_name).strip())
     clean_table_name = re.sub(r'_+', '_', clean_table_name).strip('_')
+    
     table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{clean_table_name}"
+    temp_table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{clean_table_name}_temp"
 
     gc = gspread.authorize(creds)
     sh = gc.open_by_url(gsheet_url)
@@ -124,7 +131,7 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
     # Filter baris kosong total
     data_rows_clean = [row for row in data_rows_raw if any(str(cell).strip() != "" for cell in row)]
     
-    # 1. Buat Schema BigQuery dan Parsing Nama Kolom Eksplisit
+    # 1. Susun Schema BigQuery & Nama Kolom
     schema = []
     clean_columns = []
     seen_names = set()
@@ -148,18 +155,17 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
         seen_names.add(clean_col)
         clean_columns.append(clean_col)
 
-        # Tebak Tipe Data dari Baris Sampel (Max 50 baris)
+        # Tebak Tipe Data dari Baris Sampel
         sampel_kolom = [row[idx - 1] for row in data_rows_clean[:SAMPLE_CHECK_LIMIT] if len(row) >= idx]
         data_type = tebak_tipe_kolom(sampel_kolom, clean_col)
         
-        # Tambahkan ke Schema BigQuery
         schema.append(bigquery.SchemaField(clean_col, data_type))
 
     # 2. Susun DataFrame Pandas
     df = pd.DataFrame(data_rows_clean, columns=clean_columns)
     df = df.replace(r'^\s*$', None, regex=True)
 
-    # 3. Format Isi DataFrame sesuai Schema Eksplisit yang Tertebak
+    # 3. Format DataFrame sesuai Schema
     for field in schema:
         col = field.name
         b_type = field.field_type
@@ -173,20 +179,30 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
         else:
             df[col] = df[col].astype(str).replace(["None", "<NA>", "nan"], None)
 
-    # 4. Upload ke BigQuery dengan Schema Eksplisit (autodetect=False)
+    # 4. Upload ke Tabel Sementara (TEMP)
     job_config = bigquery.LoadJobConfig(
         write_disposition="WRITE_TRUNCATE",
         schema=schema,
         autodetect=False
     )
-
-    print(f"   Mengunggah NATIVE TABLE: {BQ_DATASET}.{clean_table_name}")
-    print(f"     Status : {len(schema)} kolom ter-define eksplisit ({len(df)} baris data)")
-
-    job = client.load_table_from_dataframe(df, table_id, job_config=job_config)
+    print(f"   [1/3] Mengunggah data ke tabel temp...")
+    job = client.load_table_from_dataframe(df, temp_table_id, job_config=job_config)
     job.result()
 
-    print(f"   BERHASIL! Native Table '{clean_table_name}' siap!\n")
+    # 5. Overwrite ke Tabel Utama (Memperbarui Created Date & Expiration)
+    print(f"   [2/3] Memperbarui tabel utama & perpanjang expiration (+60 hari)...")
+    copy_config = bigquery.CopyJobConfig(write_disposition="WRITE_TRUNCATE")
+    
+    # Menghapus tabel utama terlebih dahulu agar tercipta objek baru dengan Created Date baru
+    client.delete_table(table_id, not_found_ok=True)
+    copy_job = client.copy_table(temp_table_id, table_id, job_config=copy_config)
+    copy_job.result()
+
+    # 6. Bersihkan Tabel Temp
+    print(f"   [3/3] Membersihkan file sementara...")
+    client.delete_table(temp_table_id, not_found_ok=True)
+
+    print(f"   BERHASIL! Native Table '{clean_table_name}' diperbarui penuh!\n")
 
 
 def baca_config_sheet(creds):
