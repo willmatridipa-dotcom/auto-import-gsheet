@@ -1,31 +1,29 @@
 """
 ========================================================
    ROBOT PEMBUAT BANYAK TABEL BIGQUERY DARI GSHEET
-   VERSION: v12.1-native-schema-builder (Actions & Local Ready)
+   VERSION: v12.2-explicit-native-schema (Super Accurate)
 ========================================================
 """
 
 import os
 import re
 import json
+from datetime import datetime
 import pandas as pd
 import gspread
 from google.oauth2 import service_account
 from google.cloud import bigquery
 
-SCRIPT_VERSION = "v12.1-native-schema-builder"
+SCRIPT_VERSION = "v12.2-explicit-native-schema"
 
-# ============================================================
-# SETTING
-# ============================================================
 CONFIG_SHEET_URL  = "https://docs.google.com/spreadsheets/d/1y_Z8GO2nrUFVwUv-_PnTgJL3NKQwu7koNNtfh1VRaEY"
 CONFIG_TAB_NAME   = "config"
 
 BQ_PROJECT      = "backup-444202"
 BQ_DATASET      = "DataLabReady"
 DEFAULT_RANGE   = "A1:Z10000"
+SAMPLE_CHECK_LIMIT = 50
 
-# ============================================================
 
 def buat_credentials():
     scopes = [
@@ -33,54 +31,162 @@ def buat_credentials():
         "https://www.googleapis.com/auth/drive",
         "https://www.googleapis.com/auth/spreadsheets.readonly",
     ]
-    # 1. Cek Kredensial via GitHub Environment Variable
     if "GCP_SERVICE_ACCOUNT" in os.environ:
         info = json.loads(os.environ["GCP_SERVICE_ACCOUNT"])
         if "private_key" in info:
             info["private_key"] = info["private_key"].replace("\\n", "\n")
         return service_account.Credentials.from_service_account_info(info, scopes=scopes)
     
-    # 2. Fallback jika running di komputer lokal (VS Code)
     path_kunci_lokal = os.path.join(os.path.dirname(__file__), "kunci-bg.json")
     return service_account.Credentials.from_service_account_file(path_kunci_lokal, scopes=scopes)
 
 
-def evaluasi_dan_konversi_kolom(s):
-    """
-    Menebak & Mengonversi tipe data satu kolom Pandas secara otomatis
-    (Mencakup Integer, Float, Date/Timestamp, dan String)
-    """
-    s_clean = s.dropna().astype(str).str.strip()
-    if s_clean.empty:
-        return s.astype(str)
+def evaluasi_nilai_tunggal(val_str):
+    if not val_str:
+        return None
 
-    # 1. Coba Konversi ke Date / Timestamp jika ada keyword atau pola tanggal
-    is_date_col = any(k in s.name.lower() for k in ['time', 'date', 'tgl', 'stamp', 'created', 'updated'])
-    if is_date_col:
-        parsed_dt = pd.to_datetime(s, errors='coerce', format='mixed')
-        if parsed_dt.notna().sum() > 0:
-            return parsed_dt
-
-    # 2. Coba Konversi Angka Bulat (Integer)
-    # Kebanyakan ID/Kode diawali angka 0, paksa tetap STRING agar 0 di depan tidak hilang
-    is_id_col = any(k in s.name.lower() for k in ['id', 'code', 'kode', 'phone', 'hp', 'nis', 'nik'])
-    if not is_id_col:
+    # 1. TIMESTAMP (Tanggal + Jam)
+    fmt_datetime = [
+        "%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M", "%Y-%m-%d %H:%M:%S",
+        "%d/%m/%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"
+    ]
+    for fmt in fmt_datetime:
         try:
-            # Pastikan tidak ada koma/titik format uang
-            s_num = s_clean.str.replace(',', '', regex=False)
-            if s_num.str.match(r'^-?\d+$').all():
-                return pd.to_numeric(s, errors='coerce').astype('Int64')
-        except Exception:
+            datetime.strptime(val_str, fmt)
+            return "TIMESTAMP"
+        except ValueError:
             pass
 
-        # 3. Coba Konversi Angka Desimal (Float)
+    # 2. DATE (Tanggal Saja)
+    fmt_date = ["%Y-%m-%d", "%d-%b-%Y", "%d/%m/%Y", "%m/%d/%Y"]
+    for fmt in fmt_date:
         try:
-            if s_clean.str.match(r'^-?\d+(\.\d+)?$').all():
-                return pd.to_numeric(s, errors='coerce').astype('float64')
-        except Exception:
+            datetime.strptime(val_str, fmt)
+            return "DATE"
+        except ValueError:
             pass
 
-    return s.astype(str)
+    # 3. Angka (INTEGER / FLOAT)
+    if val_str.isdigit():
+        return "INTEGER"
+    
+    try:
+        float(val_str)
+        return "FLOAT"
+    except ValueError:
+        pass
+
+    return "STRING"
+
+
+def tebak_tipe_kolom(sampel_banyak_nilai, nama_kolom):
+    # Proteksi ID, Kode, HP agar angka 0 depan tidak hilang
+    if any(k in nama_kolom.lower() for k in ['id', 'code', 'kode', 'phone', 'hp', 'nis', 'nik']):
+        return "STRING"
+
+    tipe_terdeteksi = set()
+    for val in sampel_banyak_nilai:
+        val_str = str(val).strip() if val is not None else ""
+        if not val_str:
+            continue
+        kandidat = evaluasi_nilai_tunggal(val_str)
+        if kandidat:
+            tipe_terdeteksi.add(kandidat)
+
+    if not tipe_terdeteksi:
+        return "STRING"
+
+    if "STRING" in tipe_terdeteksi or len(tipe_terdeteksi) > 1:
+        if tipe_terdeteksi == {"INTEGER", "FLOAT"}:
+            return "FLOAT"
+        return "STRING"
+
+    return tipe_terdeteksi.pop()
+
+
+def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, range_name):
+    clean_table_name = re.sub(r'[^a-zA-Z0-9_]', '_', str(table_name).strip())
+    clean_table_name = re.sub(r'_+', '_', clean_table_name).strip('_')
+    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{clean_table_name}"
+
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_url(gsheet_url)
+    ws = sh.worksheet(sheet_name)
+    
+    range_data = ws.get(range_name)
+    if not range_data or len(range_data) <= 1:
+        print(f"   SKIP: Range '{range_name}' kosong!\n")
+        return
+
+    header_row = range_data[0]
+    data_rows_raw = range_data[1:]
+
+    # Filter baris kosong total
+    data_rows_clean = [row for row in data_rows_raw if any(str(cell).strip() != "" for cell in row)]
+    
+    # 1. Buat Schema BigQuery dan Parsing Nama Kolom Eksplisit
+    schema = []
+    clean_columns = []
+    seen_names = set()
+
+    for idx, col in enumerate(header_row, start=1):
+        nama_kolom = str(col).strip()
+        clean_col = re.sub(r'[^a-zA-Z0-9_]', '_', nama_kolom) if nama_kolom else f"empty_col_{idx}"
+        clean_col = re.sub(r'_+', '_', clean_col).strip('_')
+        
+        if clean_col and clean_col[0].isdigit():
+            clean_col = f"col_{clean_col}"
+        if not clean_col:
+            clean_col = f"empty_col_{idx}"
+
+        original_clean = clean_col
+        counter = 1
+        while clean_col in seen_names:
+            clean_col = f"{original_clean}_{counter}"
+            counter += 1
+            
+        seen_names.add(clean_col)
+        clean_columns.append(clean_col)
+
+        # Tebak Tipe Data dari Baris Sampel (Max 50 baris)
+        sampel_kolom = [row[idx - 1] for row in data_rows_clean[:SAMPLE_CHECK_LIMIT] if len(row) >= idx]
+        data_type = tebak_tipe_kolom(sampel_kolom, clean_col)
+        
+        # Tambahkan ke Schema BigQuery
+        schema.append(bigquery.SchemaField(clean_col, data_type))
+
+    # 2. Susun DataFrame Pandas
+    df = pd.DataFrame(data_rows_clean, columns=clean_columns)
+    df = df.replace(r'^\s*$', None, regex=True)
+
+    # 3. Format Isi DataFrame sesuai Schema Eksplisit yang Tertebak
+    for field in schema:
+        col = field.name
+        b_type = field.field_type
+        
+        if b_type in ["TIMESTAMP", "DATE"]:
+            df[col] = pd.to_datetime(df[col], errors='coerce', format='mixed')
+        elif b_type == "INTEGER":
+            df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
+        elif b_type == "FLOAT":
+            df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
+        else:
+            df[col] = df[col].astype(str).replace(["None", "<NA>", "nan"], None)
+
+    # 4. Upload ke BigQuery dengan Schema Eksplisit (autodetect=False)
+    job_config = bigquery.LoadJobConfig(
+        write_disposition="WRITE_TRUNCATE",
+        schema=schema,
+        autodetect=False
+    )
+
+    print(f"   Mengunggah NATIVE TABLE: {BQ_DATASET}.{clean_table_name}")
+    print(f"     Status : {len(schema)} kolom ter-define eksplisit ({len(df)} baris data)")
+
+    job = client.load_table_from_dataframe(df, table_id, job_config=job_config)
+    job.result()
+
+    print(f"   BERHASIL! Native Table '{clean_table_name}' siap!\n")
 
 
 def baca_config_sheet(creds):
@@ -103,70 +209,6 @@ def baca_config_sheet(creds):
 
     print(f"Ditemukan {len(bersih)} tabel yang akan diproses.\n")
     return bersih
-
-
-def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, range_name):
-    clean_table_name = re.sub(r'[^a-zA-Z0-9_]', '_', str(table_name).strip())
-    clean_table_name = re.sub(r'_+', '_', clean_table_name).strip('_')
-    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{clean_table_name}"
-
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_url(gsheet_url)
-    ws = sh.worksheet(sheet_name)
-    
-    data = ws.get(range_name)
-    if not data or len(data) <= 1:
-        print(f"   SKIP: Range '{range_name}' kosong!\n")
-        return
-
-    # Inisialisasi DataFrame
-    df = pd.DataFrame(data[1:], columns=data[0])
-
-    # 1. Bersihkan Nama Kolom
-    clean_columns = []
-    seen_names = set()
-    for idx, col in enumerate(df.columns, start=1):
-        nama_kolom = str(col).strip()
-        clean_col = re.sub(r'[^a-zA-Z0-9_]', '_', nama_kolom) if nama_kolom else f"empty_col_{idx}"
-        clean_col = re.sub(r'_+', '_', clean_col).strip('_')
-        
-        if clean_col and clean_col[0].isdigit():
-            clean_col = f"col_{clean_col}"
-        if not clean_col:
-            clean_col = f"empty_col_{idx}"
-            
-        original_clean = clean_col
-        counter = 1
-        while clean_col in seen_names:
-            clean_col = f"{original_clean}_{counter}"
-            counter += 1
-            
-        seen_names.add(clean_col)
-        clean_columns.append(clean_col)
-        
-    df.columns = clean_columns
-
-    # 2. Bersihkan Baris Kosong
-    df = df.replace(r'^\s*$', None, regex=True)
-    df = df.dropna(how='all').reset_index(drop=True)
-
-    # 3. TYPING LOGIC: Konversi Tipe Data Setiap Kolom
-    for col in df.columns:
-        df[col] = evaluasi_dan_konversi_kolom(df[col])
-
-    # 4. Upload Ke BigQuery Native Table
-    job_config = bigquery.LoadJobConfig(
-        write_disposition="WRITE_TRUNCATE",
-        autodetect=True  # Otomatis menyesuaikan Schema BigQuery dari Tipe Data Pandas
-    )
-
-    print(f"   Mengunggah NATIVE TABLE: {BQ_DATASET}.{clean_table_name}")
-    print(f"     Jumlah Data : {len(df)} baris")
-
-    job = client.load_table_from_dataframe(df, table_id, job_config=job_config)
-    job.result()
-
-    print(f"   BERHASIL! Native Table '{clean_table_name}' dengan schema presisi siap!\n")
 
 
 def jalankan_semua():
