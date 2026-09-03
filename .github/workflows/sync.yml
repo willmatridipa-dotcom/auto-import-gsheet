@@ -24,7 +24,9 @@ jobs:
 
       - name: Create Key File from Secret
         run: |
-          echo "${{ secrets.GCP_SERVICE_ACCOUNT }}" > kunci-bg.json
+          cat << 'EOF' > kunci-bg.json
+          ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          EOF
 
       - name: Run Python Script
         run: python "Export to Bigquery"
