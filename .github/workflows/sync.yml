@@ -20,7 +20,7 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install pandas pyarrow gspread google-cloud-bigquery
+          pip install pandas pyarrow gspread google-cloud-bigquery pandas-gbq
 
       - name: Create Key File from Secret
         run: |
@@ -29,4 +29,4 @@ jobs:
           EOF
 
       - name: Run Python Script
-        run: python "Export to Bigquery"
+        run: python -W ignore "Export to Bigquery"
