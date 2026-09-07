@@ -1,30 +1,31 @@
 """
 ========================================================
    ROBOT PEMBUAT BANYAK TABEL BIGQUERY DARI GSHEET
-   VERSION: v12.3-zero-downtime-refresh (Auto Expiration)
+   VERSION: v12.4-retry-optimized (Zero-Downtime)
 ========================================================
 """
 
 import os
 import re
 import json
+import time
 from datetime import datetime
 import pandas as pd
 import gspread
 from google.oauth2 import service_account
 from google.cloud import bigquery
 
-SCRIPT_VERSION = "v12.3-zero-downtime-refresh"
+SCRIPT_VERSION = "v12.4-retry-optimized"
 
 # ============================================================
 # SETTING
 # ============================================================
-CONFIG_SHEET_URL  = "https://docs.google.com/spreadsheets/d/1y_Z8GO2nrUFVwUv-_PnTgJL3NKQwu7koNNtfh1VRaEY"
-CONFIG_TAB_NAME   = "config"
+CONFIG_SHEET_URL   = "https://docs.google.com/spreadsheets/d/1y_Z8GO2nrUFVwUv-_PnTgJL3NKQwu7koNNtfh1VRaEY"
+CONFIG_TAB_NAME    = "config"
 
-BQ_PROJECT      = "backup-444202"
-BQ_DATASET      = "DataLabReady"
-DEFAULT_RANGE   = "A1:Z10000"
+BQ_PROJECT       = "backup-444202"
+BQ_DATASET       = "DataLabReady"
+DEFAULT_RANGE    = "A1:Z10000"
 SAMPLE_CHECK_LIMIT = 50
 
 
@@ -34,14 +35,12 @@ def buat_credentials():
         "https://www.googleapis.com/auth/drive",
         "https://www.googleapis.com/auth/spreadsheets.readonly",
     ]
-    # 1. GitHub Actions Environment Variable
     if "GCP_SERVICE_ACCOUNT" in os.environ:
         info = json.loads(os.environ["GCP_SERVICE_ACCOUNT"])
         if "private_key" in info:
             info["private_key"] = info["private_key"].replace("\\n", "\n")
         return service_account.Credentials.from_service_account_info(info, scopes=scopes)
     
-    # 2. Local Fallback (VS Code)
     path_kunci_lokal = os.path.join(os.path.dirname(__file__), "kunci-bg.json")
     return service_account.Credentials.from_service_account_file(path_kunci_lokal, scopes=scopes)
 
@@ -50,7 +49,6 @@ def evaluasi_nilai_tunggal(val_str):
     if not val_str:
         return None
 
-    # 1. TIMESTAMP (Tanggal + Jam)
     fmt_datetime = [
         "%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M", "%Y-%m-%d %H:%M:%S",
         "%d/%m/%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"
@@ -62,7 +60,6 @@ def evaluasi_nilai_tunggal(val_str):
         except ValueError:
             pass
 
-    # 2. DATE (Tanggal Saja)
     fmt_date = ["%Y-%m-%d", "%d-%b-%Y", "%d/%m/%Y", "%m/%d/%Y"]
     for fmt in fmt_date:
         try:
@@ -71,7 +68,6 @@ def evaluasi_nilai_tunggal(val_str):
         except ValueError:
             pass
 
-    # 3. Angka (INTEGER / FLOAT)
     if val_str.isdigit():
         return "INTEGER"
     
@@ -85,7 +81,6 @@ def evaluasi_nilai_tunggal(val_str):
 
 
 def tebak_tipe_kolom(sampel_banyak_nilai, nama_kolom):
-    # Proteksi ID, Kode, HP agar angka 0 di depan tidak hilang
     if any(k in nama_kolom.lower() for k in ['id', 'code', 'kode', 'phone', 'hp', 'nis', 'nik']):
         return "STRING"
 
@@ -117,18 +112,28 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
     temp_table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{clean_table_name}_temp"
 
     gc = gspread.authorize(creds)
-    sh = gc.open_by_url(gsheet_url)
-    ws = sh.worksheet(sheet_name)
-    
-    range_data = ws.get(range_name)
+
+    # Retry loop khusus pembacaan Google Sheet per tabel
+    range_data = None
+    for attempt in range(1, 4):
+        try:
+            sh = gc.open_by_url(gsheet_url)
+            ws = sh.worksheet(sheet_name)
+            range_data = ws.get(range_name)
+            break
+        except Exception as e:
+            if attempt == 3:
+                raise e
+            print(f"    ⚠️ GSheet busy ({attempt}/3). Menunggu 3 detik...")
+            time.sleep(3)
+
     if not range_data or len(range_data) <= 1:
-        print(f"   SKIP: Range '{range_name}' kosong!\n")
+        print(f"    SKIP: Range '{range_name}' kosong!\n")
         return
 
     header_row = range_data[0]
     data_rows_raw = range_data[1:]
 
-    # Filter baris kosong total
     data_rows_clean = [row for row in data_rows_raw if any(str(cell).strip() != "" for cell in row)]
     
     # 1. Susun Schema BigQuery & Nama Kolom
@@ -155,29 +160,26 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
         seen_names.add(clean_col)
         clean_columns.append(clean_col)
 
-        # Tebak Tipe Data dari Baris Sampel
         sampel_kolom = [row[idx - 1] for row in data_rows_clean[:SAMPLE_CHECK_LIMIT] if len(row) >= idx]
         data_type = tebak_tipe_kolom(sampel_kolom, clean_col)
-        
         schema.append(bigquery.SchemaField(clean_col, data_type))
 
     # 2. Susun DataFrame Pandas
     df = pd.DataFrame(data_rows_clean, columns=clean_columns)
-    df = df.replace(r'^\s*$', None, regex=True)
 
-    # 3. Format DataFrame sesuai Schema
+    # 3. Format DataFrame sesuai Schema (Versi Ringan)
     for field in schema:
         col = field.name
         b_type = field.field_type
         
         if b_type in ["TIMESTAMP", "DATE"]:
-            df[col] = pd.to_datetime(df[col], errors='coerce', format='mixed')
+            df[col] = pd.to_datetime(df[col], errors='coerce')
         elif b_type == "INTEGER":
             df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
         elif b_type == "FLOAT":
             df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
         else:
-            df[col] = df[col].astype(str).replace(["None", "<NA>", "nan"], None)
+            df[col] = df[col].astype(str).replace(["None", "<NA>", "nan", ""], None)
 
     # 4. Upload ke Tabel Sementara (TEMP)
     job_config = bigquery.LoadJobConfig(
@@ -189,11 +191,9 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
     job = client.load_table_from_dataframe(df, temp_table_id, job_config=job_config)
     job.result()
 
-    # 5. Overwrite ke Tabel Utama (Memperbarui Created Date & Expiration)
+    # 5. Overwrite ke Tabel Utama
     print(f"   [2/3] Memperbarui tabel utama & perpanjang expiration (+60 hari)...")
     copy_config = bigquery.CopyJobConfig(write_disposition="WRITE_TRUNCATE")
-    
-    # Menghapus tabel utama terlebih dahulu agar tercipta objek baru dengan Created Date baru
     client.delete_table(table_id, not_found_ok=True)
     copy_job = client.copy_table(temp_table_id, table_id, job_config=copy_config)
     copy_job.result()
@@ -205,25 +205,22 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
     print(f"   BERHASIL! Native Table '{clean_table_name}' diperbarui penuh!\n")
 
 
-import time
-
 def baca_config_sheet(creds):
     gc = gspread.authorize(creds)
     
-    # Retry loop khusus panggilan API yang rawan error 503
     max_retries = 3
+    semua = []
     for attempt in range(1, max_retries + 1):
         try:
             ws = gc.open_by_url(CONFIG_SHEET_URL).worksheet(CONFIG_TAB_NAME)
             semua = ws.get_all_records()
-            break  # Berhasil ambil data, keluar dari loop retry
+            break
         except Exception as e:
             if attempt == max_retries:
-                raise e  # Jika sudah 3x gagal, lemparkan error ke runner
-            print(f"⚠️ Google API busy/503. Mencoba ulang ({attempt}/{max_retries}) dalam 5 detik...")
-            time.sleep(5)
+                raise e
+            print(f"⚠️ Google API busy/503. Mencoba ulang ({attempt}/{max_retries}) dalam 2 detik...")
+            time.sleep(2)
 
-    # Logika pembersihan data (tetap sama seperti kodemuu)
     bersih = []
     for baris in semua:
         table_name = str(baris.get("table_name", "")).strip()
@@ -239,6 +236,7 @@ def baca_config_sheet(creds):
 
     print(f"Ditemukan {len(bersih)} tabel yang akan diproses.\n")
     return bersih
+
 
 def jalankan_semua():
     print("=" * 60)
@@ -261,8 +259,11 @@ def jalankan_semua():
             )
             berhasil += 1
         except Exception as e:
-            print(f"   GAGAL: {e}\n")
+            print(f"    GAGAL: {e}\n")
             gagal += 1
+
+        # Jeda 1 detik antar tabel agar API Google tidak overload
+        time.sleep(1)
 
     print("=" * 60)
     print(f"     SELESAI! Berhasil: {berhasil} | Gagal: {gagal}")
