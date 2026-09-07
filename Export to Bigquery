@@ -89,11 +89,12 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
             
         clean_headers.append(c_clean)
 
-    # 3. DataFrame Setup Tanpa Parsing Manual
+    # 3. DataFrame Setup Ringan (TANPA REGEX BERAT)
     df = pd.DataFrame(data_rows, columns=clean_headers)
     
-    # Ubah spasi murni/string kosong jadi None (NULL di BigQuery)
-    df.replace(r'^\s*$', None, regex=True, inplace=True)
+    # Trim spasi & ubah string kosong langsung jadi None (Cepat & Ringan)
+    df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
+    df.replace("", None, inplace=True)
     df.dropna(how='all', inplace=True)
 
     # Antisipasi objek terstruktur (dict/list) kotor agar PyArrow tidak crash
