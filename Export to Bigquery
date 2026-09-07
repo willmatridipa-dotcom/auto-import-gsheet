@@ -213,7 +213,7 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
         print(f"   Tidak menghapus tabel temp agar bisa diperiksa manual.\n")
         return
 
-    print(f"     Rows: temp={temp_rows} dest={dest_rows}")
+    print(f"     Rows: {temp_rows}")
     if dest_rows != temp_rows:
         print("   WARNING: Jumlah baris pada tabel tujuan berbeda dengan tabel temp.")
         print("   Tidak menghapus tabel temp agar Anda bisa menyelidiki perbedaan.\n")
