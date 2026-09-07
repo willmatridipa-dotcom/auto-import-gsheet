@@ -13,6 +13,8 @@ import pandas as pd
 import gspread
 from google.oauth2 import service_account
 from google.cloud import bigquery
+from google.api_core.retry import Retry
+from google.api_core.exceptions import GoogleAPICallError, RetryError
 
 SCRIPT_VERSION = "v12.3-zero-downtime-refresh"
 
@@ -182,6 +184,16 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
             df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
         else:
             df[col] = df[col].astype(str).replace(["None", "<NA>", "nan"], None)
+
+    # ------------------------------------------------------------
+    # DEFINISIKAN CUSTOM RETRY DI SINI (SEBELUM PANGGILAN BIGQUERY)
+    # ------------------------------------------------------------
+    custom_retry = Retry(
+        initial=2.0,
+        maximum=30.0,
+        multiplier=2.0,
+        deadline=300.0  # Batas waktu mencoba ulang maksimal 5 menit
+    )
 
     # 4. Upload ke Tabel Sementara (TEMP)
     job_config = bigquery.LoadJobConfig(
