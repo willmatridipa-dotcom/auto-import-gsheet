@@ -1,7 +1,7 @@
 """
 ========================================================
    ROBOT PEMBUAT BANYAK TABEL BIGQUERY DARI GSHEET
-   VERSION: v12.7-anti-503 (Ultra Fast + Auto-Retry)
+   VERSION: v12.9-range-aware (Fix Specific Range & Clean Parsing)
 ========================================================
 """
 
@@ -15,7 +15,7 @@ import gspread
 from google.oauth2 import service_account
 from google.cloud import bigquery
 
-SCRIPT_VERSION = "v12.7-anti-503"
+SCRIPT_VERSION = "v12.9-range-aware"
 
 # ============================================================
 # KONFIGURASI
@@ -42,84 +42,93 @@ def buat_credentials():
     return service_account.Credentials.from_service_account_file(path_kunci_lokal, scopes=scopes)
 
 
-def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name):
-    # Sanitize Nama Tabel
+def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, range_name=None):
     clean_table_name = re.sub(r'[^a-zA-Z0-9_]', '_', str(table_name).strip()).strip('_')
     table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{clean_table_name}"
 
     gc = gspread.authorize(creds)
 
-    # 1. Ambil Data (Retry Logic Exponential Backoff khusus Anti-503)
-    data = None
+    # 1. Ambil Data Berdasarkan Range yang Disebutkan di Config Sheet
+    rows = None
     max_retries = 5
     for attempt in range(1, max_retries + 1):
         try:
             sh = gc.open_by_url(gsheet_url)
             ws = sh.worksheet(sheet_name)
-            data = ws.get_all_records()
+            
+            # Jika range_name diisi di config, gunakan get(range_name)
+            if range_name and str(range_name).strip():
+                rows = ws.get(str(range_name).strip())
+            else:
+                rows = ws.get_all_values()
             break
         except Exception as e:
             err_msg = str(e)
             if ("503" in err_msg or "429" in err_msg or "Quota" in err_msg or "unavailable" in err_msg.lower()) and attempt < max_retries:
                 sleep_time = (2 ** attempt) + random.uniform(1, 2)
-                print(f"   ⚠️ Google API Sibuk/503. Retry {attempt}/{max_retries} dalam {sleep_time:.1f} detik...")
+                print(f"   ⚠️ Google API Sibuk/503. Retry {attempt}/{max_retries} dalam {sleep_time:.1f}s...")
                 time.sleep(sleep_time)
             else:
                 raise e
 
-    if not data:
-        print(f"    SKIP: Sheet '{sheet_name}' kosong!\n")
+    if not rows or len(rows) < 2:
+        print(f"    SKIP: Sheet '{sheet_name}' (Range: {range_name}) kosong atau hanya berisi header!\n")
         return
 
-    # 2. Parsing Data & Pembersihan Ringan
-    df = pd.DataFrame(data)
+    # 2. Ambil Header dari Baris Pertama Range & Data Baris Sisa
+    raw_headers = rows[0]
+    data_rows = rows[1:]
 
-    # A. Clean Header Kolom
-    clean_cols = {}
-    seen_cols = set()
-    for col in df.columns:
+    # Clean Header: Mencegah error karakter ilegal, kolom kosong, dan duplikat
+    clean_headers = []
+    seen_cols = {}
+    for idx, col in enumerate(raw_headers):
         c_clean = re.sub(r'[^a-zA-Z0-9_]', '_', str(col).strip()).strip('_')
         if not c_clean or c_clean[0].isdigit():
-            c_clean = f"col_{c_clean}"
+            c_clean = f"col_{idx+1}"
         
-        orig = c_clean
-        counter = 1
-        while c_clean in seen_cols:
-            c_clean = f"{orig}_{counter}"
-            counter += 1
-        seen_cols.add(c_clean)
-        clean_cols[col] = c_clean
+        if c_clean in seen_cols:
+            seen_cols[c_clean] += 1
+            c_clean = f"{c_clean}_{seen_cols[c_clean]}"
+        else:
+            seen_cols[c_clean] = 0
+            
+        clean_headers.append(c_clean)
 
-    df.rename(columns=clean_cols, inplace=True)
-
-    # B. Clean Baris Kosong & Trim White space
+    # 3. Buat DataFrame & Normalisasi Tipe Data
+    df = pd.DataFrame(data_rows, columns=clean_headers)
+    
+    # Hapus baris yang benar-benar kosong
+    df.replace("", None, inplace=True)
     df.dropna(how='all', inplace=True)
-    df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
+    df.fillna("", inplace=True)
 
-    # 3. Direct Overwrite (WRITE_TRUNCATE) + Server-side Autodetect
+    # Konversi aman ke string agar PyArrow tidak error
+    for col in df.columns:
+        df[col] = df[col].astype(str).str.strip()
+
+    # 4. Direct Overwrite (WRITE_TRUNCATE) + BigQuery Autodetect
     job_config = bigquery.LoadJobConfig(
         write_disposition="WRITE_TRUNCATE",
         autodetect=True
     )
     
     job = client.load_table_from_dataframe(df, table_id, job_config=job_config)
-    job.result()  # Menunggu hasil dari server BigQuery
+    job.result()
 
     print(f"   BERHASIL! Table '{clean_table_name}' diperbarui!\n")
-    
-    # Micro-delay cegah hit rate limit beruntun
     time.sleep(1.2)
 
 
 def baca_config_sheet(creds):
     gc = gspread.authorize(creds)
-    semua = []
+    rows = []
     
     max_retries = 5
     for attempt in range(1, max_retries + 1):
         try:
             ws = gc.open_by_url(CONFIG_SHEET_URL).worksheet(CONFIG_TAB_NAME)
-            semua = ws.get_all_records()
+            rows = ws.get_all_values()
             break
         except Exception as e:
             err_msg = str(e)
@@ -129,14 +138,21 @@ def baca_config_sheet(creds):
             else:
                 raise e
 
+    if not rows or len(rows) < 2:
+        return []
+
+    headers = [str(h).strip().lower() for h in rows[0]]
     bersih = []
-    for baris in semua:
-        t_name = str(baris.get("table_name", "")).strip()
+    
+    for row in rows[1:]:
+        row_dict = dict(zip(headers, row))
+        t_name = str(row_dict.get("table_name", "")).strip()
         if t_name:
             bersih.append({
                 "table_name": t_name,
-                "gsheet_url": str(baris.get("gsheet_url", "")).strip(),
-                "sheet_name": str(baris.get("sheet_name", "")).strip(),
+                "gsheet_url": str(row_dict.get("gsheet_url", "")).strip(),
+                "sheet_name": str(row_dict.get("sheet_name", "")).strip(),
+                "range_name": str(row_dict.get("range_name", row_dict.get("range", ""))).strip(), # Membaca kolom range/range_name
             })
 
     print(f"Ditemukan {len(bersih)} tabel yang akan diproses.\n")
@@ -155,11 +171,12 @@ def jalankan_semua():
     berhasil, gagal = 0, 0
 
     for nomor, baris in enumerate(daftar_tabel, start=1):
-        print(f"[{nomor}/{len(daftar_tabel)}] Memproses '{baris['table_name']}'...")
+        print(f"[{nomor}/{len(daftar_tabel)}] Memproses '{baris['table_name']}' (Range: {baris.get('range_name') or 'ALL'})...")
         try:
             buat_satu_tabel_native(
                 client, creds, baris["table_name"],
-                baris["gsheet_url"], baris["sheet_name"]
+                baris["gsheet_url"], baris["sheet_name"],
+                baris.get("range_name")
             )
             berhasil += 1
         except Exception as e:
