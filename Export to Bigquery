@@ -1,7 +1,7 @@
 """
 ========================================================
    ROBOT PEMBUAT BANYAK TABEL BIGQUERY DARI GSHEET
-   VERSION: v12.9-range-aware (Fix Specific Range & Clean Parsing)
+   VERSION: v12.9.1-smart-autodetect
 ========================================================
 """
 
@@ -15,11 +15,8 @@ import gspread
 from google.oauth2 import service_account
 from google.cloud import bigquery
 
-SCRIPT_VERSION = "v12.9-range-aware"
+SCRIPT_VERSION = "v12.9.1-smart-autodetect"
 
-# ============================================================
-# KONFIGURASI
-# ============================================================
 CONFIG_SHEET_URL = "https://docs.google.com/spreadsheets/d/1y_Z8GO2nrUFVwUv-_PnTgJL3NKQwu7koNNtfh1VRaEY"
 CONFIG_TAB_NAME  = "config"
 BQ_PROJECT     = "backup-444202"
@@ -48,7 +45,7 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
 
     gc = gspread.authorize(creds)
 
-    # 1. Ambil Data
+    # 1. Ambil Data Berdasarkan Range
     rows = None
     max_retries = 5
     for attempt in range(1, max_retries + 1):
@@ -73,7 +70,7 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
         print(f"    SKIP: Sheet '{sheet_name}' (Range: {range_name}) kosong!\n")
         return
 
-    # 2. Ambil Header & Sanitasi
+    # 2. Header Sanitization
     raw_headers = rows[0]
     data_rows = rows[1:]
 
@@ -92,27 +89,27 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
             
         clean_headers.append(c_clean)
 
-    # 3. Buat DataFrame & Tipe Data Fleksibel
+    # 3. DataFrame Setup Tanpa Parsing Manual
     df = pd.DataFrame(data_rows, columns=clean_headers)
     
-    # Hapus baris yang benar-benar kosong
-    df.replace(r'^\s*$', None, regex=True, inplace=True) # Ubah string kosong/spasi jadi None (NULL)
+    # Ubah spasi murni/string kosong jadi None (NULL di BigQuery)
+    df.replace(r'^\s*$', None, regex=True, inplace=True)
     df.dropna(how='all', inplace=True)
 
-    # Ganti objek kotor/list/dict yang bikin PyArrow crash jadi string, sisanya biarkan native
+    # Antisipasi objek terstruktur (dict/list) kotor agar PyArrow tidak crash
     for col in df.columns:
         df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, (dict, list)) else x)
 
-    # 4. Direct Overwrite dengan Schema Auto-Detect dari BigQuery
+    # 4. Overwrite & Serahkan Inferensi Tipe Data ke BigQuery
     job_config = bigquery.LoadJobConfig(
         write_disposition="WRITE_TRUNCATE",
-        autodetect=True # BigQuery yang akan tentukan mana INT, FLOAT, TIMESTAMP, STRING
+        autodetect=True
     )
     
     job = client.load_table_from_dataframe(df, table_id, job_config=job_config)
     job.result()
 
-    print(f"   BERHASIL! Table '{clean_table_name}' diperbarui (Type Data Auto-Detect)!\n")
+    print(f"   BERHASIL! Table '{clean_table_name}' diperbarui dengan Tipe Data Bawaan!\n")
     time.sleep(1.2)
 
 
@@ -148,7 +145,7 @@ def baca_config_sheet(creds):
                 "table_name": t_name,
                 "gsheet_url": str(row_dict.get("gsheet_url", "")).strip(),
                 "sheet_name": str(row_dict.get("sheet_name", "")).strip(),
-                "range_name": str(row_dict.get("range_name", row_dict.get("range", ""))).strip(), # Membaca kolom range/range_name
+                "range_name": str(row_dict.get("range_name", row_dict.get("range", ""))).strip(),
             })
 
     print(f"Ditemukan {len(bersih)} tabel yang akan diproses.\n")
