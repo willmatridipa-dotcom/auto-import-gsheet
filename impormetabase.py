@@ -1,90 +1,175 @@
+"""
+========================================================
+   ROBOT PEMBUAT BANYAK TABEL BIGQUERY DARI GSHEET
+   VERSION: v12.7 (Ultra Fast + Auto-Retry)
+========================================================
+"""
+
 import os
+import re
 import json
-import gspread
-import requests
+import time
+import random
 import pandas as pd
-import io
-from oauth2client.service_account import ServiceAccountCredentials
+import gspread
+from google.oauth2 import service_account
+from google.cloud import bigquery
 
-def get_metabase_data():
-    # --- CONFIG METABASE ---
-    # Ganti dengan URL Metabase kamu (jangan ada slash / di ujung)
-    METABASE_URL = "https://mb-dynamic.rata.id" # Hapus slash di ujung agar konsisten
-    USERNAME = os.getenv('METABASE_USER')
-    PASSWORD = os.getenv('METABASE_PASS')
-  
+SCRIPT_VERSION = "v12.7-anti-503"
+
+# ============================================================
+# KONFIGURASI
+# ============================================================
+CONFIG_SHEET_URL = "https://docs.google.com/spreadsheets/d/1y_Z8GO2nrUFVwUv-_PnTgJL3NKQwu7koNNtfh1VRaEY"
+CONFIG_TAB_NAME  = "config"
+BQ_PROJECT     = "backup-444202"
+BQ_DATASET     = "DataLabReady"
+
+
+def buat_credentials():
+    scopes = [
+        "https://www.googleapis.com/auth/bigquery",
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+    ]
+    if "GCP_SERVICE_ACCOUNT" in os.environ:
+        info = json.loads(os.environ["GCP_SERVICE_ACCOUNT"])
+        if "private_key" in info:
+            info["private_key"] = info["private_key"].replace("\\n", "\n")
+        return service_account.Credentials.from_service_account_info(info, scopes=scopes)
     
-    # ID Question/Card yang mau ditarik
-    CARD_ID = "39" 
+    path_kunci_lokal = os.path.join(os.path.dirname(__file__), "kunci-bg.json")
+    return service_account.Credentials.from_service_account_file(path_kunci_lokal, scopes=scopes)
 
-    print("--- STEP 1: Login ke Metabase ---")
-    try:
-        auth_res = requests.post(f"{METABASE_URL}/api/session", json={
-            "username": USERNAME, 
-            "password": PASSWORD
-        }, timeout=15)
-        
-        if auth_res.status_code != 200:
-            print(f"Login Gagal! Status: {auth_res.status_code}")
-            return None
-            
-        session_id = auth_res.json()["id"]
-        headers = {"X-Metabase-Session": session_id}
-        print("Login Berhasil!")
 
-        print(f"--- STEP 2: Menarik Data Card {CARD_ID} ---")
-        # Kita pakai format CSV karena paling enteng buat data ribuan row
-        export_res = requests.post(f"{METABASE_URL}/api/card/{CARD_ID}/query/csv", headers=headers, timeout=60)
-        
-        if export_res.status_code == 200:
-            df = pd.read_csv(io.StringIO(export_res.text))
-            df = df.fillna("") # Hilangkan NaN agar GSheet gak error
-            
-            # Konvert ke list of lists (Format yang dimengerti GSheet)
-            data_final = [df.columns.values.tolist()] + df.values.tolist()
-            print(f"Berhasil menarik {len(data_final)} baris data.")
-            return data_final
-        else:
-            print(f"Gagal tarik data! Status: {export_res.status_code}")
-            return None
-            
-    except Exception as e:
-        print(f"Error di Metabase: {e}")
-        return None
+def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name):
+    # Sanitize Nama Tabel
+    clean_table_name = re.sub(r'[^a-zA-Z0-9_]', '_', str(table_name).strip()).strip('_')
+    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{clean_table_name}"
 
-def upload_to_gsheet(data):
-    print("--- STEP 3: Upload ke Google Sheets ---")
-    try:
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    gc = gspread.authorize(creds)
+
+    # 1. Ambil Data (Retry Logic Exponential Backoff khusus Anti-503)
+    data = None
+    max_retries = 5
+    for attempt in range(1, max_retries + 1):
+        try:
+            sh = gc.open_by_url(gsheet_url)
+            ws = sh.worksheet(sheet_name)
+            data = ws.get_all_records()
+            break
+        except Exception as e:
+            err_msg = str(e)
+            if ("503" in err_msg or "429" in err_msg or "Quota" in err_msg or "unavailable" in err_msg.lower()) and attempt < max_retries:
+                sleep_time = (2 ** attempt) + random.uniform(1, 2)
+                print(f"   ⚠️ Google API Sibuk/503. Retry {attempt}/{max_retries} dalam {sleep_time:.1f} detik...")
+                time.sleep(sleep_time)
+            else:
+                raise e
+
+    if not data:
+        print(f"    SKIP: Sheet '{sheet_name}' kosong!\n")
+        return
+
+    # 2. Parsing Data & Pembersihan Ringan
+    df = pd.DataFrame(data)
+
+    # A. Clean Header Kolom
+    clean_cols = {}
+    seen_cols = set()
+    for col in df.columns:
+        c_clean = re.sub(r'[^a-zA-Z0-9_]', '_', str(col).strip()).strip('_')
+        if not c_clean or c_clean[0].isdigit():
+            c_clean = f"col_{c_clean}"
         
-        # --- PERBAIKAN DI SINI ---
-        # Kita ambil isi JSON dari Secret GitHub, bukan dari file credentials.json
-        creds_raw = os.getenv('GCP_SERVICE_ACCOUNT')
-        if not creds_raw:
-            print("Error: Secret GCP_SERVICE_ACCOUNT tidak ditemukan!")
-            return
-            
-        creds_info = json.loads(creds_raw)
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_info, scope)
-        client = gspread.authorize(creds)
-        # -------------------------
-        
-        # ID GSheet Baru yang kamu kasih
-        ID_GSHEET = "1OTLX_utgRO_iUNeESw5K83fI8p9sLjWvdXZy7-iuSoQ"
-        sh = client.open_by_key(ID_GSHEET)
-        ws = sh.worksheet("order_payment")
-        
-        print("Membersihkan sheet lama...")
-        ws.batch_clear(["A2:L"])
-        
-        print("Mengirim data baru...")
-        ws.update(values=data, range_name='A1')
-        print("--- SEMUA SELESAI! Cek Google Sheet kamu ---")
-        
-    except Exception as e:
-        print(f"Error di GSheet: {e}")
+        orig = c_clean
+        counter = 1
+        while c_clean in seen_cols:
+            c_clean = f"{orig}_{counter}"
+            counter += 1
+        seen_cols.add(c_clean)
+        clean_cols[col] = c_clean
+
+    df.rename(columns=clean_cols, inplace=True)
+
+    # B. Clean Baris Kosong & Trim White space
+    df.dropna(how='all', inplace=True)
+    df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
+
+    # 3. Direct Overwrite (WRITE_TRUNCATE) + Server-side Autodetect
+    job_config = bigquery.LoadJobConfig(
+        write_disposition="WRITE_TRUNCATE",
+        autodetect=True
+    )
+    
+    job = client.load_table_from_dataframe(df, table_id, job_config=job_config)
+    job.result()  # Menunggu hasil dari server BigQuery
+
+    print(f"   BERHASIL! Table '{clean_table_name}' diperbarui!\n")
+    
+    # Micro-delay cegah hit rate limit beruntun
+    time.sleep(1.2)
+
+
+def baca_config_sheet(creds):
+    gc = gspread.authorize(creds)
+    semua = []
+    
+    max_retries = 5
+    for attempt in range(1, max_retries + 1):
+        try:
+            ws = gc.open_by_url(CONFIG_SHEET_URL).worksheet(CONFIG_TAB_NAME)
+            semua = ws.get_all_records()
+            break
+        except Exception as e:
+            err_msg = str(e)
+            if ("503" in err_msg or "429" in err_msg or "Quota" in err_msg) and attempt < max_retries:
+                sleep_time = (2 ** attempt) + random.uniform(1, 2)
+                time.sleep(sleep_time)
+            else:
+                raise e
+
+    bersih = []
+    for baris in semua:
+        t_name = str(baris.get("table_name", "")).strip()
+        if t_name:
+            bersih.append({
+                "table_name": t_name,
+                "gsheet_url": str(baris.get("gsheet_url", "")).strip(),
+                "sheet_name": str(baris.get("sheet_name", "")).strip(),
+            })
+
+    print(f"Ditemukan {len(bersih)} tabel yang akan diproses.\n")
+    return bersih
+
+
+def jalankan_semua():
+    print("=" * 60)
+    print(f"     ROBOT NATIVE TABLE BIGQUERY ({SCRIPT_VERSION})")
+    print("=" * 60 + "\n")
+
+    creds  = buat_credentials()
+    client = bigquery.Client(credentials=creds, project=BQ_PROJECT)
+    daftar_tabel = baca_config_sheet(creds)
+
+    berhasil, gagal = 0, 0
+
+    for nomor, baris in enumerate(daftar_tabel, start=1):
+        print(f"[{nomor}/{len(daftar_tabel)}] Memproses '{baris['table_name']}'...")
+        try:
+            buat_satu_tabel_native(
+                client, creds, baris["table_name"],
+                baris["gsheet_url"], baris["sheet_name"]
+            )
+            berhasil += 1
+        except Exception as e:
+            print(f"    GAGAL: {e}\n")
+            gagal += 1
+
+    print("=" * 60)
+    print(f"     SELESAI! Berhasil: {berhasil} | Gagal: {gagal}")
+    print("=" * 60)
+
 
 if __name__ == "__main__":
-    hasil_data = get_metabase_data()
-    if hasil_data:
-        upload_to_gsheet(hasil_data)
+    jalankan_semua()
