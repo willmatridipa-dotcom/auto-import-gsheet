@@ -48,7 +48,7 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
 
     gc = gspread.authorize(creds)
 
-    # 1. Ambil Data Berdasarkan Range yang Disebutkan di Config Sheet
+    # 1. Ambil Data
     rows = None
     max_retries = 5
     for attempt in range(1, max_retries + 1):
@@ -56,7 +56,6 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
             sh = gc.open_by_url(gsheet_url)
             ws = sh.worksheet(sheet_name)
             
-            # Jika range_name diisi di config, gunakan get(range_name)
             if range_name and str(range_name).strip():
                 rows = ws.get(str(range_name).strip())
             else:
@@ -66,20 +65,18 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
             err_msg = str(e)
             if ("503" in err_msg or "429" in err_msg or "Quota" in err_msg or "unavailable" in err_msg.lower()) and attempt < max_retries:
                 sleep_time = (2 ** attempt) + random.uniform(1, 2)
-                print(f"   ⚠️ Google API Sibuk/503. Retry {attempt}/{max_retries} dalam {sleep_time:.1f}s...")
                 time.sleep(sleep_time)
             else:
                 raise e
 
     if not rows or len(rows) < 2:
-        print(f"    SKIP: Sheet '{sheet_name}' (Range: {range_name}) kosong atau hanya berisi header!\n")
+        print(f"    SKIP: Sheet '{sheet_name}' (Range: {range_name}) kosong!\n")
         return
 
-    # 2. Ambil Header dari Baris Pertama Range & Data Baris Sisa
+    # 2. Ambil Header & Sanitasi
     raw_headers = rows[0]
     data_rows = rows[1:]
 
-    # Clean Header: Mencegah error karakter ilegal, kolom kosong, dan duplikat
     clean_headers = []
     seen_cols = {}
     for idx, col in enumerate(raw_headers):
@@ -95,28 +92,27 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
             
         clean_headers.append(c_clean)
 
-    # 3. Buat DataFrame & Normalisasi Tipe Data
+    # 3. Buat DataFrame & Tipe Data Fleksibel
     df = pd.DataFrame(data_rows, columns=clean_headers)
     
     # Hapus baris yang benar-benar kosong
-    df.replace("", None, inplace=True)
+    df.replace(r'^\s*$', None, regex=True, inplace=True) # Ubah string kosong/spasi jadi None (NULL)
     df.dropna(how='all', inplace=True)
-    df.fillna("", inplace=True)
 
-    # Konversi aman ke string agar PyArrow tidak error
+    # Ganti objek kotor/list/dict yang bikin PyArrow crash jadi string, sisanya biarkan native
     for col in df.columns:
-        df[col] = df[col].astype(str).str.strip()
+        df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, (dict, list)) else x)
 
-    # 4. Direct Overwrite (WRITE_TRUNCATE) + BigQuery Autodetect
+    # 4. Direct Overwrite dengan Schema Auto-Detect dari BigQuery
     job_config = bigquery.LoadJobConfig(
         write_disposition="WRITE_TRUNCATE",
-        autodetect=True
+        autodetect=True # BigQuery yang akan tentukan mana INT, FLOAT, TIMESTAMP, STRING
     )
     
     job = client.load_table_from_dataframe(df, table_id, job_config=job_config)
     job.result()
 
-    print(f"   BERHASIL! Table '{clean_table_name}' diperbarui!\n")
+    print(f"   BERHASIL! Table '{clean_table_name}' diperbarui (Type Data Auto-Detect)!\n")
     time.sleep(1.2)
 
 
