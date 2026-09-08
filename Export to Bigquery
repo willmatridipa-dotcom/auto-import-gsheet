@@ -1,7 +1,7 @@
 """
 ========================================================
    ROBOT PEMBUAT BANYAK TABEL BIGQUERY DARI GSHEET
-   VERSION: v12.7-fix-retry-param (Super Stable)
+   VERSION: v12.8-fix-job-retry (Fixed LoadJob Retry)
 ========================================================
 """
 
@@ -17,7 +17,7 @@ from google.cloud import bigquery
 from google.api_core.retry import Retry
 from google.api_core.exceptions import ServiceUnavailable
 
-SCRIPT_VERSION = "v12.7-fix-retry-param"
+SCRIPT_VERSION = "v12.8-fix-job-retry"
 
 # ============================================================
 # SETTING
@@ -222,7 +222,6 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
             for id_name, en_name in BULAN_ID_TO_EN.items():
                 col_series = col_series.str.replace(rf'\b{id_name}\b', en_name, case=False, regex=True)
             
-            # Penggunaan format='mixed' untuk menghilangkan UserWarning
             parsed_dt = pd.to_datetime(col_series, errors='coerce', format='mixed')
             
             if b_type == "TIMESTAMP":
@@ -237,16 +236,15 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
         else:
             df[col] = df[col].astype(str).replace(["None", "<NA>", "nan"], None)
 
-    # 4. HAPUS TABEL LAMA (Atur retry di parameter fungsi)
+    # 4. HAPUS TABEL LAMA (Atur retry di delete_table)
     print(f"   [1/3] Menghapus tabel lama '{clean_table_name}' jika ada...")
     client.delete_table(table_id, not_found_ok=True, retry=bq_retry)
 
-    # 5. UPLOAD DATA (Atur retry di dalam job_config)
+    # 5. UPLOAD DATA
     job_config = bigquery.LoadJobConfig(
         write_disposition="WRITE_TRUNCATE",
         schema=schema,
-        autodetect=False,
-        retry=bq_retry  # 👈 DITARUH DI SINI BUKAN DI load_table_from_dataframe
+        autodetect=False
     )
     print(f"   [2/3] Membuat ulang tabel '{clean_table_name}' & mengunggah data...")
     
@@ -255,7 +253,8 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
         table_id, 
         job_config=job_config
     )
-    job.result()
+    # retry dipasang pada .result() untuk menunggu penyelesaian job
+    job.result(retry=bq_retry)
 
     # 6. ATUR EXPIRATION +60 HARI
     print(f"   [3/3] Mengatur tanggal kadaluarsa (+60 hari)...")
