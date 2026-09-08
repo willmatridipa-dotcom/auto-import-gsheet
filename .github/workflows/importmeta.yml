@@ -10,15 +10,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
+
       - name: Install Libs
-        run: pip install gspread oauth2client pandas requests
+        run: |
+          python -m pip install --upgrade pip
+          pip install gspread oauth2client pandas requests google-cloud-bigquery
+
       - name: Run Script
         env:
           GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
           METABASE_USER: ${{ secrets.METABASE_USER }}
           METABASE_PASS: ${{ secrets.METABASE_PASS }}
-        run: python impormetabase.py # <--- INI KUNCINYA (Nama file baru)
+        run: python impormetabase.py
