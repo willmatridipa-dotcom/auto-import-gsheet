@@ -1,22 +1,23 @@
 """
 ========================================================
    ROBOT PEMBUAT BANYAK TABEL BIGQUERY DARI GSHEET
-   VERSION: v12.3-zero-downtime-refresh (Auto Expiration)
+   VERSION: v12.6-recreate-table-reset-creation (Reset Expiration)
 ========================================================
 """
 
 import os
 import re
 import json
+import time
 from datetime import datetime, timedelta
 import pandas as pd
 import gspread
 from google.oauth2 import service_account
 from google.cloud import bigquery
 from google.api_core.retry import Retry
-from google.api_core.exceptions import GoogleAPICallError, RetryError
+from google.api_core.exceptions import ServiceUnavailable
 
-SCRIPT_VERSION = "v12.3-zero-downtime-refresh"
+SCRIPT_VERSION = "v12.6-recreate-table-reset-creation"
 
 # ============================================================
 # SETTING
@@ -29,6 +30,22 @@ BQ_DATASET      = "DataLabReady"
 DEFAULT_RANGE   = "A1:Z10000"
 SAMPLE_CHECK_LIMIT = 50
 
+# Pemetaan Bulan Indonesia ke Inggris
+BULAN_ID_TO_EN = {
+    'januari': 'january', 'jan': 'jan',
+    'februari': 'february', 'feb': 'feb',
+    'maret': 'march', 'mar': 'mar',
+    'april': 'april', 'apr': 'apr',
+    'mei': 'may',
+    'juni': 'june', 'jun': 'jun',
+    'juli': 'july', 'jul': 'jul',
+    'agustus': 'august', 'agu': 'aug', 'ags': 'aug',
+    'september': 'september', 'sep': 'sep',
+    'oktober': 'october', 'okt': 'oct',
+    'november': 'november', 'nov': 'nov',
+    'desember': 'december', 'des': 'dec'
+}
+
 
 def buat_credentials():
     scopes = [
@@ -36,44 +53,73 @@ def buat_credentials():
         "https://www.googleapis.com/auth/drive",
         "https://www.googleapis.com/auth/spreadsheets.readonly",
     ]
-    # 1. GitHub Actions Environment Variable
     if "GCP_SERVICE_ACCOUNT" in os.environ:
         info = json.loads(os.environ["GCP_SERVICE_ACCOUNT"])
         if "private_key" in info:
             info["private_key"] = info["private_key"].replace("\\n", "\n")
         return service_account.Credentials.from_service_account_info(info, scopes=scopes)
     
-    # 2. Local Fallback (VS Code)
     path_kunci_lokal = os.path.join(os.path.dirname(__file__), "kunci-bg.json")
     return service_account.Credentials.from_service_account_file(path_kunci_lokal, scopes=scopes)
+
+
+def ambil_data_gsheet_dengan_retry(creds, gsheet_url, sheet_name, range_name, max_retries=5):
+    for attempt in range(1, max_retries + 1):
+        try:
+            gc = gspread.authorize(creds)
+            sh = gc.open_by_url(gsheet_url)
+            ws = sh.worksheet(sheet_name)
+            return ws.get(range_name)
+        except Exception as e:
+            if "503" in str(e) or isinstance(e, (ServiceUnavailable, gspread.exceptions.APIError)):
+                if attempt == max_retries:
+                    raise e
+                jeda = 2 ** attempt
+                print(f"   ⚠️ Google API 503/Error. Mencoba ulang dalam {jeda} detik... ({attempt}/{max_retries})")
+                time.sleep(jeda)
+            else:
+                raise e
+
+
+def normalisasi_bulan_indo(val_str):
+    val_lower = val_str.lower()
+    for id_name, en_name in BULAN_ID_TO_EN.items():
+        val_lower = re.sub(rf'\b{id_name}\b', en_name, val_lower)
+    return val_lower
 
 
 def evaluasi_nilai_tunggal(val_str):
     if not val_str:
         return None
 
-    # 1. TIMESTAMP (Tanggal + Jam)
+    val_str_norm = normalisasi_bulan_indo(val_str)
+
+    # 1. TIMESTAMP
     fmt_datetime = [
         "%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M", "%Y-%m-%d %H:%M:%S",
-        "%d/%m/%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"
+        "%d/%m/%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f",
+        "%d %B %Y %H:%M:%S", "%d %B %Y %H:%M"
     ]
     for fmt in fmt_datetime:
         try:
-            datetime.strptime(val_str, fmt)
+            datetime.strptime(val_str_norm, fmt)
             return "TIMESTAMP"
         except ValueError:
             pass
 
-    # 2. DATE (Tanggal Saja)
-    fmt_date = ["%Y-%m-%d", "%d-%b-%Y", "%d/%m/%Y", "%m/%d/%Y"]
+    # 2. DATE
+    fmt_date = [
+        "%Y-%m-%d", "%d-%b-%Y", "%d/%m/%Y", "%m/%d/%Y",
+        "%d %b %Y", "%d %B %Y", "%d-%B-%Y"
+    ]
     for fmt in fmt_date:
         try:
-            datetime.strptime(val_str, fmt)
+            datetime.strptime(val_str_norm, fmt)
             return "DATE"
         except ValueError:
             pass
 
-    # 3. Angka (INTEGER / FLOAT)
+    # 3. Angka
     if val_str.isdigit():
         return "INTEGER"
     
@@ -87,7 +133,6 @@ def evaluasi_nilai_tunggal(val_str):
 
 
 def tebak_tipe_kolom(sampel_banyak_nilai, nama_kolom):
-    # Proteksi ID, Kode, HP agar angka 0 di depan tidak hilang
     if any(k in nama_kolom.lower() for k in ['id', 'code', 'kode', 'phone', 'hp', 'nis', 'nik']):
         return "STRING"
 
@@ -116,13 +161,15 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
     clean_table_name = re.sub(r'_+', '_', clean_table_name).strip('_')
     
     table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{clean_table_name}"
-    temp_table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{clean_table_name}"
 
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_url(gsheet_url)
-    ws = sh.worksheet(sheet_name)
-    
-    range_data = ws.get(range_name)
+    bq_retry = Retry(
+        initial=2.0,
+        maximum=30.0,
+        multiplier=2.0,
+        deadline=300.0
+    )
+
+    range_data = ambil_data_gsheet_dengan_retry(creds, gsheet_url, sheet_name, range_name)
     if not range_data or len(range_data) <= 1:
         print(f"   SKIP: Range '{range_name}' kosong!\n")
         return
@@ -130,7 +177,6 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
     header_row = range_data[0]
     data_rows_raw = range_data[1:]
 
-    # Filter baris kosong total
     data_rows_clean = [row for row in data_rows_raw if any(str(cell).strip() != "" for cell in row)]
     
     # 1. Susun Schema BigQuery & Nama Kolom
@@ -157,7 +203,6 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
         seen_names.add(clean_col)
         clean_columns.append(clean_col)
 
-        # Tebak Tipe Data dari Baris Sampel
         sampel_kolom = [row[idx - 1] for row in data_rows_clean[:SAMPLE_CHECK_LIMIT] if len(row) >= idx]
         data_type = tebak_tipe_kolom(sampel_kolom, clean_col)
         
@@ -167,17 +212,23 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
     df = pd.DataFrame(data_rows_clean, columns=clean_columns)
     df = df.replace(r'^\s*$', None, regex=True)
 
-    # 3. Format DataFrame sesuai Schema
+    # 3. Format Isi DataFrame sesuai Schema
     for field in schema:
         col = field.name
         b_type = field.field_type
         
-        if b_type == "TIMESTAMP":
-            # keep as datetime64 for BigQuery TIMESTAMP
-            df[col] = pd.to_datetime(df[col], errors='coerce', utc=False)
-        elif b_type == "DATE":
-            # convert to date objects for BigQuery DATE
-            df[col] = pd.to_datetime(df[col], errors='coerce').dt.date
+        if b_type in ["TIMESTAMP", "DATE"]:
+            col_series = df[col].astype(str)
+            for id_name, en_name in BULAN_ID_TO_EN.items():
+                col_series = col_series.str.replace(rf'\b{id_name}\b', en_name, case=False, regex=True)
+            
+            parsed_dt = pd.to_datetime(col_series, errors='coerce')
+            
+            if b_type == "TIMESTAMP":
+                df[col] = parsed_dt
+            else:
+                df[col] = parsed_dt.dt.date
+                
         elif b_type == "INTEGER":
             df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
         elif b_type == "FLOAT":
@@ -185,61 +236,33 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
         else:
             df[col] = df[col].astype(str).replace(["None", "<NA>", "nan"], None)
 
-    # ------------------------------------------------------------
-    # DEFINISIKAN CUSTOM RETRY DI SINI (SEBELUM PANGGILAN BIGQUERY)
-    # ------------------------------------------------------------
-    custom_retry = Retry(
-        initial=2.0,
-        maximum=30.0,
-        multiplier=2.0,
-        deadline=300.0  # Batas waktu mencoba ulang maksimal 5 menit
-    )
+    # 4. HAPUS TABEL LAMA (Agar creation_time ter-reset saat buat baru)
+    print(f"   [1/3] Menghapus tabel lama '{clean_table_name}' jika ada...")
+    client.delete_table(table_id, not_found_ok=True, retry=bq_retry)
 
-    # 4. Upload ke Tabel Sementara (TEMP)
+    # 5. UPLOAD DATA (Tabel otomatis terbuat kembali)
     job_config = bigquery.LoadJobConfig(
         write_disposition="WRITE_TRUNCATE",
         schema=schema,
         autodetect=False
     )
-    print(f"   [1/3] Mengunggah data ke tabel temp...")
-    job = client.load_table_from_dataframe(df, temp_table_id, job_config=job_config)
+    print(f"   [2/3] Membuat ulang tabel '{clean_table_name}' & mengunggah data...")
+    
+    job = client.load_table_from_dataframe(
+        df, 
+        table_id, 
+        job_config=job_config, 
+        retry=bq_retry
+    )
     job.result()
 
-    # 5. Overwrite ke Tabel Utama (zero-downtime via COPY WRITE_TRUNCATE)
-    print(f"   [2/3] Memperbarui tabel utama & perpanjang expiration (+60 hari)...")
-    copy_config = bigquery.CopyJobConfig(write_disposition="WRITE_TRUNCATE")
+    # 6. ATUR EXPIRATION +60 HARI (Dihitung dari Waktu Pembuatan Baru)
+    print(f"   [3/3] Mengatur tanggal kadaluarsa (+60 hari)...")
+    dest_tbl = client.get_table(table_id, retry=bq_retry)
+    dest_tbl.expires = datetime.utcnow() + timedelta(days=60)
+    client.update_table(dest_tbl, ["expires"], retry=bq_retry)
 
-    # NOTE: Do NOT delete the destination table before copy. COPY with WRITE_TRUNCATE
-    # will atomically replace the table contents.
-    copy_job = client.copy_table(temp_table_id, table_id, job_config=copy_config)
-    copy_job.result()
-
-    # Verification: compare row counts between temp and destination
-    try:
-        temp_tbl = client.get_table(temp_table_id)
-        dest_tbl = client.get_table(table_id)
-        temp_rows = temp_tbl.num_rows
-        dest_rows = dest_tbl.num_rows
-    except Exception as e:
-        print(f"   WARNING: gagal mengambil metadata tabel setelah copy: {e}")
-        print(f"   Tidak menghapus tabel temp agar bisa diperiksa manual.\n")
-        return
-
-    print(f"     Rows: {temp_rows}")
-    if dest_rows != temp_rows:
-        print("   WARNING: Jumlah baris pada tabel tujuan berbeda dengan tabel temp.")
-        print("   Tidak menghapus tabel temp agar Anda bisa menyelidiki perbedaan.\n")
-        return
-
-    # Set expiration on destination table (e.g., +60 days)
-    dest_tbl.expires = datetime.utcnow() + timedelta(days=59)
-    client.update_table(dest_tbl, ["expires"])
-
-    # 6. Bersihkan Tabel Temp
-    print(f"   [3/3] Membersihkan file sementara...")
-    client.delete_table(temp_table_id, not_found_ok=True)
-
-    print(f"   BERHASIL! Native Table '{clean_table_name}' diperbarui penuh!\n")
+    print(f"   BERHASIL! Tabel '{clean_table_name}' dibuat ulang ({len(df)} baris data)!\n")
 
 
 def baca_config_sheet(creds):
