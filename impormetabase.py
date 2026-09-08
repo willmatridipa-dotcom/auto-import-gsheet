@@ -1,132 +1,90 @@
-#!/usr/bin/env python3
-"""
-impormetabase.py
-
-Fetches a Metabase card as CSV and uploads it to a Google Sheet.
-
-Configuration via environment variables:
-- METABASE_URL (e.g. https://mb-dynamic.rata.id) [required]
-- METABASE_USER, METABASE_PASS [required]
-- METABASE_CARD_ID (card id or question id) [required]
-- GCP_SERVICE_ACCOUNT (JSON string of service account key) [required]
-- GSHEET_ID (spreadsheet id) [required]
-- GSHEET_SHEET_NAME (worksheet name, default: "order_payment")
-"""
-from typing import List, Optional
 import os
 import json
-import io
-import sys
+import gspread
 import requests
 import pandas as pd
-import gspread
-from google.oauth2.service_account import Credentials as ServiceAccountCredentials
+import io
+from oauth2client.service_account import ServiceAccountCredentials
 
-def get_env(name: str, required: bool = True, default: Optional[str] = None) -> Optional[str]:
-    val = os.getenv(name, default)
-    if required and not val:
-        raise EnvironmentError(f"Missing required environment variable: {name}")
-    return val
+def get_metabase_data():
+    # --- CONFIG METABASE ---
+    # Ganti dengan URL Metabase kamu (jangan ada slash / di ujung)
+    METABASE_URL = "https://mb-dynamic.rata.id" # Hapus slash di ujung agar konsisten
+    USERNAME = os.getenv('METABASE_USER')
+    PASSWORD = os.getenv('METABASE_PASS')
+  
+    
+    # ID Question/Card yang mau ditarik
+    CARD_ID = "39" 
 
-def get_metabase_data(metabase_url: str, username: str, password: str, card_id: str, timeout: int = 60) -> Optional[List[List]]:
-    """
-    Log into Metabase and export the specified card as CSV.
-    Returns data as list-of-lists (including header row) or None on failure.
-    """
-    session = requests.Session()
-    login_url = f"{metabase_url.rstrip('/')}/api/session"
+    print("--- STEP 1: Login ke Metabase ---")
     try:
-        resp = session.post(login_url, json={"username": username, "password": password}, timeout=15)
-        resp.raise_for_status()
-        session_id = resp.json().get("id")
-        if not session_id:
-            print("Metabase login succeeded but no session id returned.", file=sys.stderr)
+        auth_res = requests.post(f"{METABASE_URL}/api/session", json={
+            "username": USERNAME, 
+            "password": PASSWORD
+        }, timeout=15)
+        
+        if auth_res.status_code != 200:
+            print(f"Login Gagal! Status: {auth_res.status_code}")
             return None
-        session.headers.update({"X-Metabase-Session": session_id})
+            
+        session_id = auth_res.json()["id"]
+        headers = {"X-Metabase-Session": session_id}
+        print("Login Berhasil!")
+
+        print(f"--- STEP 2: Menarik Data Card {CARD_ID} ---")
+        # Kita pakai format CSV karena paling enteng buat data ribuan row
+        export_res = requests.post(f"{METABASE_URL}/api/card/{CARD_ID}/query/csv", headers=headers, timeout=60)
+        
+        if export_res.status_code == 200:
+            df = pd.read_csv(io.StringIO(export_res.text))
+            df = df.fillna("") # Hilangkan NaN agar GSheet gak error
+            
+            # Konvert ke list of lists (Format yang dimengerti GSheet)
+            data_final = [df.columns.values.tolist()] + df.values.tolist()
+            print(f"Berhasil menarik {len(data_final)} baris data.")
+            return data_final
+        else:
+            print(f"Gagal tarik data! Status: {export_res.status_code}")
+            return None
+            
     except Exception as e:
-        print(f"[Metabase] Login failed: {e}", file=sys.stderr)
+        print(f"Error di Metabase: {e}")
         return None
 
-    csv_url = f"{metabase_url.rstrip('/')}/api/card/{card_id}/query/csv"
+def upload_to_gsheet(data):
+    print("--- STEP 3: Upload ke Google Sheets ---")
     try:
-        resp = session.post(csv_url, timeout=timeout)
-        resp.raise_for_status()
-        # read into pandas for convenience and normalize NaNs
-        df = pd.read_csv(io.StringIO(resp.text))
-        df = df.fillna("")
-        data = [df.columns.tolist()] + df.values.tolist()
-        print(f"[Metabase] Pulled {len(data)-1} rows (+ header).")
-        return data
-    except Exception as e:
-        print(f"[Metabase] Failed to export card {card_id} as CSV: {e}", file=sys.stderr)
-        return None
-
-def upload_to_gsheet(data: List[List], creds_info: dict, spreadsheet_id: str, sheet_name: str = "order_payment"):
-    """
-    Uploads a list-of-lists to a worksheet. Keeps row 1 as header (A1) and replaces rows below it.
-    """
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_service_account_info(creds_info, scopes=scopes)
-    client = gspread.authorize(creds)
-
-    sh = client.open_by_key(spreadsheet_id)
-    try:
-        ws = sh.worksheet(sheet_name)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=sheet_name, rows=100, cols=max(10, len(data[0]) if data else 10))
-
-    # Ensure header row is set and clear everything below
-    if not data:
-        print("[GSheet] No data to upload.")
-        return
-
-    header = data[0]
-    body = data[1:]
-
-    # Set header in A1
-    ws.update("A1", [header], value_input_option="USER_ENTERED")
-    # Resize sheet to 1 row so old rows are removed, then append new rows (if any)
-    if body:
-        # resize to 1 row to remove old contents below header
-        ws.resize(rows=1)
-        # append_rows will add rows below header
-        ws.append_rows(body, value_input_option="USER_ENTERED")
-    else:
-        # no body rows - just ensure sheet has single header row
-        ws.resize(rows=1)
-
-    print(f"[GSheet] Uploaded {len(body)} rows to '{sheet_name}' in spreadsheet {spreadsheet_id}.")
-
-def main():
-    try:
-        METABASE_URL = get_env("METABASE_URL")
-        METABASE_USER = get_env("METABASE_USER")
-        METABASE_PASS = get_env("METABASE_PASS")
-        METABASE_CARD_ID = get_env("METABASE_CARD_ID")
-
-        GSHEET_ID = get_env("GSHEET_ID")
-        GSHEET_SHEET_NAME = os.getenv("GSHEET_SHEET_NAME", "order_payment")
-
-        creds_raw = get_env("GCP_SERVICE_ACCOUNT")
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        
+        # --- PERBAIKAN DI SINI ---
+        # Kita ambil isi JSON dari Secret GitHub, bukan dari file credentials.json
+        creds_raw = os.getenv('GCP_SERVICE_ACCOUNT')
+        if not creds_raw:
+            print("Error: Secret GCP_SERVICE_ACCOUNT tidak ditemukan!")
+            return
+            
         creds_info = json.loads(creds_raw)
-
-    except EnvironmentError as ee:
-        print(f"[Config] {ee}", file=sys.stderr)
-        sys.exit(1)
-    except json.JSONDecodeError:
-        print("[Config] GCP_SERVICE_ACCOUNT is not valid JSON", file=sys.stderr)
-        sys.exit(1)
-
-    data = get_metabase_data(METABASE_URL, METABASE_USER, METABASE_PASS, METABASE_CARD_ID)
-    if not data:
-        print("[Main] No data retrieved from Metabase.", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        upload_to_gsheet(data, creds_info, GSHEET_ID, GSHEET_SHEET_NAME)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_info, scope)
+        client = gspread.authorize(creds)
+        # -------------------------
+        
+        # ID GSheet Baru yang kamu kasih
+        ID_GSHEET = "1OTLX_utgRO_iUNeESw5K83fI8p9sLjWvdXZy7-iuSoQ"
+        sh = client.open_by_key(ID_GSHEET)
+        ws = sh.worksheet("order_payment")
+        
+        print("Membersihkan sheet lama...")
+        ws.batch_clear(["A2:L"])
+        
+        print("Mengirim data baru...")
+        ws.update(values=data, range_name='A1')
+        print("--- SEMUA SELESAI! Cek Google Sheet kamu ---")
+        
     except Exception as e:
-        print(f"[Main] Failed to upload to Google Sheets: {e}", file=sys.stderr)
-        sys.exit(1)
+        print(f"Error di GSheet: {e}")
 
 if __name__ == "__main__":
-    main()
+    hasil_data = get_metabase_data()
+    if hasil_data:
+        upload_to_gsheet(hasil_data)
