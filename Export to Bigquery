@@ -1,7 +1,7 @@
 """
 ========================================================
    ROBOT PEMBUAT BANYAK TABEL BIGQUERY DARI GSHEET
-   VERSION: v12.6-recreate-table-reset-creation (Reset Expiration)
+   VERSION: v12.7-fix-retry-param (Super Stable)
 ========================================================
 """
 
@@ -17,7 +17,7 @@ from google.cloud import bigquery
 from google.api_core.retry import Retry
 from google.api_core.exceptions import ServiceUnavailable
 
-SCRIPT_VERSION = "v12.6-recreate-table-reset-creation"
+SCRIPT_VERSION = "v12.7-fix-retry-param"
 
 # ============================================================
 # SETTING
@@ -222,7 +222,8 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
             for id_name, en_name in BULAN_ID_TO_EN.items():
                 col_series = col_series.str.replace(rf'\b{id_name}\b', en_name, case=False, regex=True)
             
-            parsed_dt = pd.to_datetime(col_series, errors='coerce')
+            # Penggunaan format='mixed' untuk menghilangkan UserWarning
+            parsed_dt = pd.to_datetime(col_series, errors='coerce', format='mixed')
             
             if b_type == "TIMESTAMP":
                 df[col] = parsed_dt
@@ -236,27 +237,27 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
         else:
             df[col] = df[col].astype(str).replace(["None", "<NA>", "nan"], None)
 
-    # 4. HAPUS TABEL LAMA (Agar creation_time ter-reset saat buat baru)
+    # 4. HAPUS TABEL LAMA (Atur retry di parameter fungsi)
     print(f"   [1/3] Menghapus tabel lama '{clean_table_name}' jika ada...")
     client.delete_table(table_id, not_found_ok=True, retry=bq_retry)
 
-    # 5. UPLOAD DATA (Tabel otomatis terbuat kembali)
+    # 5. UPLOAD DATA (Atur retry di dalam job_config)
     job_config = bigquery.LoadJobConfig(
         write_disposition="WRITE_TRUNCATE",
         schema=schema,
-        autodetect=False
+        autodetect=False,
+        retry=bq_retry  # 👈 DITARUH DI SINI BUKAN DI load_table_from_dataframe
     )
     print(f"   [2/3] Membuat ulang tabel '{clean_table_name}' & mengunggah data...")
     
     job = client.load_table_from_dataframe(
         df, 
         table_id, 
-        job_config=job_config, 
-        retry=bq_retry
+        job_config=job_config
     )
     job.result()
 
-    # 6. ATUR EXPIRATION +60 HARI (Dihitung dari Waktu Pembuatan Baru)
+    # 6. ATUR EXPIRATION +60 HARI
     print(f"   [3/3] Mengatur tanggal kadaluarsa (+60 hari)...")
     dest_tbl = client.get_table(table_id, retry=bq_retry)
     dest_tbl.expires = datetime.utcnow() + timedelta(days=60)
