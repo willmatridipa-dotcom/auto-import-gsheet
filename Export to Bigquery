@@ -116,7 +116,7 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
     clean_table_name = re.sub(r'_+', '_', clean_table_name).strip('_')
     
     table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{clean_table_name}"
-    temp_table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{clean_table_name}_temp"
+    temp_table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{clean_table_name}"
 
     gc = gspread.authorize(creds)
     sh = gc.open_by_url(gsheet_url)
@@ -232,7 +232,7 @@ def buat_satu_tabel_native(client, creds, table_name, gsheet_url, sheet_name, ra
         return
 
     # Set expiration on destination table (e.g., +60 days)
-    dest_tbl.expires = datetime.utcnow() + timedelta(days=60)
+    dest_tbl.expires = datetime.utcnow() + timedelta(days=59)
     client.update_table(dest_tbl, ["expires"])
 
     # 6. Bersihkan Tabel Temp
